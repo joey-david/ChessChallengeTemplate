@@ -40,7 +40,7 @@ def parse_args():
         help="Embedding dimension"
     )
     parser.add_argument(
-        "--n_layer", type=int, default=6,
+        "--n_layer", type=int, default=4,
         help="Number of transformer layers"
     )
     parser.add_argument(
@@ -155,17 +155,21 @@ def main():
     print("=" * 60)
     
     # Build tokenizer from dataset
-    print("\n📖 Building tokenizer from dataset...")
+    print("\nBuilding tokenizer from dataset...")
     tokenizer = ChessTokenizer.build_vocab_from_dataset(
         dataset_name=args.dataset_name,
-        max_samples=100000,  # Use subset for vocabulary
+        min_frequency=500,  # Only keep moves that appear at least 500 times
+        max_samples=100000,  # Use 100k games to build vocabulary
     )
     print(f"   Vocabulary size: {tokenizer.vocab_size}")
     
+    # Use the vocab size from tokenizer (override args if provided)
+    actual_vocab_size = tokenizer.vocab_size
+    
     # Create model configuration
-    print("\n🔧 Creating model configuration...")
+    print("\nCreating model configuration...")
     config = ChessConfig(
-        vocab_size=tokenizer.vocab_size,
+        vocab_size=actual_vocab_size,
         n_embd=args.n_embd,
         n_layer=args.n_layer,
         n_head=args.n_head,
@@ -182,18 +186,18 @@ def main():
     print_parameter_budget(config)
     
     # Create model
-    print("\n🏗️ Creating model...")
+    print("\nCreating model...")
     model = ChessForCausalLM(config)
     n_params = count_parameters(model)
     print(f"   Total parameters: {n_params:,}")
     
     if n_params > 1_000_000:
-        print("⚠️  WARNING: Model exceeds 1M parameter limit!")
+        print("WARNING: Model exceeds 1M parameter limit!")
     else:
         print("✓  Model is within 1M parameter limit")
     
     # Load datasets
-    print("\n📊 Loading datasets...")
+    print("\nLoading datasets...")
     train_dataset, val_dataset = create_train_val_datasets(
         tokenizer=tokenizer,
         dataset_name=args.dataset_name,
@@ -229,7 +233,7 @@ def main():
         hub_model_id=args.hub_model_id,
         seed=args.seed,
         bf16=torch.cuda.is_available() and torch.cuda.is_bf16_supported(),
-        report_to=["tensorboard"],
+        report_to=["none"],
     )
     
     # Create trainer
@@ -243,7 +247,7 @@ def main():
     )
     
     # Train
-    print("\n🚀 Starting training...")
+    print("\nStarting training...")
     trainer.train()
     
     # Save final model
@@ -256,7 +260,7 @@ def main():
         print("\n📤 Pushing to Hugging Face Hub...")
         trainer.push_to_hub()
     
-    print("\n✅ Training complete!")
+    print("\nTraining complete!")
     print(f"   Model saved to: {args.output_dir}/final_model")
 
 

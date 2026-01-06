@@ -89,80 +89,14 @@ class ChessTokenizer(PreTrainedTokenizer):
     
     def _create_default_vocab(self) -> Dict[str, int]:
         """
-        Create a default vocabulary with special tokens and common moves.
+        Create a minimal default vocabulary with just special tokens.
         
-        For the full vocabulary, use `build_vocab_from_dataset()` or
-        `build_vocab_from_iterator()`.
+        For the full vocabulary, use `build_vocab_from_dataset()`.
+        This minimal vocab is just a placeholder - you should build from data.
         """
         special_tokens = [self.PAD_TOKEN, self.BOS_TOKEN, self.EOS_TOKEN, self.UNK_TOKEN]
-        
-        # Generate all possible moves in the dataset format
-        all_moves = self._generate_all_possible_moves()
-        
-        vocab = {}
-        for idx, token in enumerate(special_tokens + all_moves):
-            vocab[token] = idx
-        
+        vocab = {token: idx for idx, token in enumerate(special_tokens)}
         return vocab
-    
-    def _generate_all_possible_moves(self) -> List[str]:
-        """
-        Generate all possible chess moves in the extended UCI format.
-        
-        Format: [W|B][P|N|B|R|Q|K][source][dest][suffix]
-        Suffixes: (x), (+), (+*), (o), (O), (x+), (x+*)
-        
-        Returns:
-            List of all possible move strings.
-        """
-        moves = []
-        
-        files = "abcdefgh"
-        ranks = "12345678"
-        squares = [f + r for f in files for r in ranks]
-        
-        colors = ["W", "B"]
-        pieces = ["P", "N", "B", "R", "Q", "K"]
-        
-        # Regular moves: piece from square to square
-        suffixes = ["", "(x)", "(+)", "(x+)", "(+*)", "(x+*)"]
-        
-        for color in colors:
-            for piece in pieces:
-                for src in squares:
-                    for dst in squares:
-                        if src != dst:
-                            base_move = f"{color}{piece}{src}{dst}"
-                            for suffix in suffixes:
-                                moves.append(base_move + suffix)
-        
-        # Pawn promotions: add promotion piece
-        promotion_pieces = ["Q", "R", "B", "N"]
-        for color in colors:
-            # White promotions (rank 7 to 8)
-            if color == "W":
-                src_rank, dst_rank = "7", "8"
-            else:  # Black promotions (rank 2 to 1)
-                src_rank, dst_rank = "2", "1"
-            
-            for src_file in files:
-                for dst_file in files:
-                    # Only allow same file or adjacent file (for captures)
-                    if abs(ord(src_file) - ord(dst_file)) <= 1:
-                        src = src_file + src_rank
-                        dst = dst_file + dst_rank
-                        for promo in promotion_pieces:
-                            for suffix in suffixes:
-                                moves.append(f"{color}P{src}{dst}={promo}{suffix}")
-        
-        # Castling
-        for color in colors:
-            # Kingside castling
-            moves.append(f"{color}Ke1g1(o)" if color == "W" else f"{color}Ke8g8(o)")
-            # Queenside castling
-            moves.append(f"{color}Ke1c1(O)" if color == "W" else f"{color}Ke8c8(O)")
-        
-        return moves
     
     @classmethod
     def build_vocab_from_iterator(
@@ -209,8 +143,8 @@ class ChessTokenizer(PreTrainedTokenizer):
         dataset_name: str = "dlouapre/lichess_2025-01_1M",
         split: str = "train",
         column: str = "text",
-        min_frequency: int = 1,
-        max_samples: Optional[int] = None,
+        min_frequency: int = 500,
+        max_samples: Optional[int] = 100000,
     ) -> "ChessTokenizer":
         """
         Build a tokenizer vocabulary from a Hugging Face dataset.
@@ -219,8 +153,8 @@ class ChessTokenizer(PreTrainedTokenizer):
             dataset_name: Name of the dataset on Hugging Face Hub.
             split: Dataset split to use.
             column: Column containing the game strings.
-            min_frequency: Minimum frequency for a token to be included.
-            max_samples: Maximum number of samples to process.
+            min_frequency: Minimum frequency for a token to be included (default: 500).
+            max_samples: Maximum number of samples to process (default: 100k).
         
         Returns:
             A ChessTokenizer with the built vocabulary.

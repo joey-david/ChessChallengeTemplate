@@ -30,9 +30,9 @@ class ChessConfig(PretrainedConfig):
     Students can adjust these values to explore different architectures.
     
     Parameter budget breakdown (with default values):
-    - Embeddings (vocab): 1200 × 128 = 153,600
-    - Position Embeddings: 256 × 128 = 32,768
-    - Transformer Layers: 6 × ~120,000 = ~720,000
+    - Embeddings (vocab): 1200 x 128 = 153,600
+    - Position Embeddings: 256 x 128 = 32,768
+    - Transformer Layers: 6 x ~120,000 = ~720,000
     - LM Head (with weight tying): 0 (shared with embeddings)
     - Total: ~906,000 parameters
     
@@ -42,7 +42,7 @@ class ChessConfig(PretrainedConfig):
         n_layer: Number of transformer layers.
         n_head: Number of attention heads.
         n_ctx: Maximum sequence length (context window).
-        n_inner: Feed-forward inner dimension (default: 4 * n_embd).
+        n_inner: Feed-forward inner dimension (default: 3 * n_embd).
         dropout: Dropout probability.
         layer_norm_epsilon: Epsilon for layer normalization.
         tie_weights: Whether to tie embedding and output weights.
@@ -78,7 +78,7 @@ class ChessConfig(PretrainedConfig):
         self.n_layer = n_layer
         self.n_head = n_head
         self.n_ctx = n_ctx
-        self.n_inner = n_inner if n_inner is not None else 4 * n_embd
+        self.n_inner = n_inner if n_inner is not None else 3 * n_embd  # Reduced from 4x to 3x
         self.dropout = dropout
         self.layer_norm_epsilon = layer_norm_epsilon
         self.tie_weights = tie_weights
@@ -258,6 +258,10 @@ class ChessForCausalLM(PreTrainedModel):
         
         # Output head
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        
+        # Declare tied weights for proper serialization
+        if config.tie_weights:
+            self._tied_weights_keys = ["lm_head.weight"]
         
         # Initialize weights
         self.post_init()

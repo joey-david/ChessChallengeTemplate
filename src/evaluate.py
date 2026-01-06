@@ -74,7 +74,7 @@ class ChessEvaluator:
                 self.engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
                 self.engine.configure({"Skill Level": stockfish_level})
             else:
-                print("⚠️  Stockfish not found. Install it for full evaluation.")
+                print("WARNING: Stockfish not found. Install it for full evaluation.")
                 self.engine = None
                 
         except ImportError:
@@ -525,7 +525,7 @@ def main():
     print("=" * 60)
     
     # Load model
-    print(f"\n📦 Loading model from: {args.model_path}")
+    print(f"\nLoading model from: {args.model_path}")
     
     if "/" in args.model_path and not args.model_path.startswith("."):
         # Assume Hugging Face model ID
@@ -540,7 +540,7 @@ def main():
         model = AutoModelForCausalLM.from_pretrained(args.model_path)
     
     # Create evaluator
-    print(f"\n🎮 Setting up evaluator...")
+    print(f"\nSetting up evaluator...")
     evaluator = ChessEvaluator(
         model=model,
         tokenizer=tokenizer,

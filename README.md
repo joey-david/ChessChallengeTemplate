@@ -90,11 +90,11 @@ Here's a typical budget:
 
 | Component | Calculation | Params |
 |-----------|-------------|--------|
-| Token Embeddings | V × d | ~154,000 |
+| Token Embeddings | V × d | ~128,000 |
 | Position Embeddings | n_ctx × d | ~33,000 |
-| Transformer Layers | L × ~120k | ~720,000 |
+| Transformer Layers | L × ~148k | ~592,000 |
 | LM Head | (tied) | 0 |
-| **Total** | | **~907,000** |
+| **Total** | | **~753,000** |
 
 Use the utility function to check your budget:
 
@@ -104,7 +104,7 @@ from src import ChessConfig, print_parameter_budget
 config = ChessConfig(
     vocab_size=1200,
     n_embd=128,
-    n_layer=6,
+    n_layer=4,
     n_head=4,
 )
 print_parameter_budget(config)
@@ -120,19 +120,29 @@ print_parameter_budget(config)
 
 ### Custom Tokenizer
 
-The template provides a move-level tokenizer. You can customize it:
+The template provides a move-level tokenizer that builds vocabulary from the actual dataset.
+
+**Key parameters:**
+- `min_frequency`: Only include moves that appear at least N times (default: 500)
+- `max_samples`: Number of games to scan when building vocabulary (default: 100k)
 
 ```python
 from src import ChessTokenizer
 
-# Build from dataset
+# Build from dataset with frequency filtering
 tokenizer = ChessTokenizer.build_vocab_from_dataset(
     dataset_name="dlouapre/lichess_2025-01_1M",
-    min_frequency=10,  # Only keep frequent moves
+    min_frequency=500,  # Higher = smaller vocab, but may miss rare moves
+    max_samples=100000,  # More samples = more complete vocab
 )
 
-# Or create a custom one by inheriting from PreTrainedTokenizer
+# Typical vocabulary sizes:
+# min_frequency=100 -> ~7k tokens (too many)
+# min_frequency=500 -> ~1k tokens (recommended, stays under 1M params)
+# min_frequency=1000 -> ~600 tokens (may miss some valid moves)
 ```
+
+**The tokenizer only includes moves that actually appear in real games**, avoiding the 32k bloat of generating all theoretical moves.
 
 ### Custom Architecture
 
@@ -145,9 +155,9 @@ from src import ChessConfig, ChessForCausalLM
 config = ChessConfig(
     vocab_size=1200,
     n_embd=128,      # Try 96, 128, or 192
-    n_layer=6,       # Try 4, 6, or 8
+    n_layer=4,       # Try 3, 4, or 6
     n_head=4,        # Try 4 or 8
-    n_inner=512,     # Feed-forward dimension
+    n_inner=384,     # Feed-forward dimension (default: 3*n_embd)
     dropout=0.1,
     tie_weights=True,
 )
