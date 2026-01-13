@@ -43,6 +43,19 @@ source .venv/bin/activate  # On Windows: venv\Scripts\activate
 uv pip install -e .
 ```
 
+### Docker
+
+```bash
+# Build the image
+docker build -t chess-challenge .
+
+# Run with GPU (if available) and mount your workspace
+docker run --rm -it --gpus all \
+  -u $(id -u):$(id -g) \
+  -v "$PWD:/workspace" -w /workspace \
+  chess-challenge bash
+```
+
 ### Train a Model
 
 ```bash
