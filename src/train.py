@@ -48,7 +48,7 @@ def parse_args():
         help="Number of attention heads"
     )
     parser.add_argument(
-        "--n_ctx", type=int, default=256,
+        "--n_ctx", type=int, default=384,
         help="Maximum context length"
     )
     parser.add_argument(
@@ -56,7 +56,7 @@ def parse_args():
         help="Feed-forward inner dimension (default: 4 * n_embd)"
     )
     parser.add_argument(
-        "--dropout", type=float, default=0.1,
+        "--dropout", type=float, default=0.05,
         help="Dropout probability"
     )
     parser.add_argument(
