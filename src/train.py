@@ -63,6 +63,15 @@ def parse_args():
         "--no_tie_weights", action="store_true",
         help="Disable weight tying between embedding and output layers"
     )
+    parser.add_argument(
+        "--legal_loss_weight", type=float, default=0.0,
+        help="Auxiliary loss weight for legal-move probability mass"
+    )
+    parser.add_argument(
+        "--legal_loss_positions", type=str, default="last",
+        choices=["last", "all", "random"],
+        help="Positions to apply legal loss: last, all, or random"
+    )
     
     # Data arguments
     parser.add_argument(
@@ -151,6 +160,14 @@ def main():
     
     # Use the vocab size from tokenizer (override args if provided)
     actual_vocab_size = tokenizer.vocab_size
+
+    # Build id-to-token mapping for inference-time legal masking
+    vocab = tokenizer.get_vocab()
+    max_id = max(vocab.values()) if vocab else -1
+    id_to_token = [tokenizer.unk_token] * (max_id + 1)
+    for token, idx in vocab.items():
+        if 0 <= idx <= max_id:
+            id_to_token[idx] = token
     
     # Create model configuration
     print("\nCreating model configuration...")
@@ -163,6 +180,9 @@ def main():
         n_inner=args.n_inner,
         dropout=args.dropout,
         tie_weights=not args.no_tie_weights,
+        legal_loss_weight=args.legal_loss_weight,
+        legal_loss_positions=args.legal_loss_positions,
+        id_to_token=id_to_token,
         pad_token_id=tokenizer.pad_token_id,
         bos_token_id=tokenizer.bos_token_id,
         eos_token_id=tokenizer.eos_token_id,

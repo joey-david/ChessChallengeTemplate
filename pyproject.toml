@@ -46,6 +46,7 @@ eval = [
 [project.scripts]
 chess-train = "src.train:main"
 chess-eval = "src.evaluate:main"
+chess-rl = "src.rl_train:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

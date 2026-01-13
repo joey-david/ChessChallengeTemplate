@@ -74,6 +74,16 @@ def main():
     repo_id = f"{organization}/{args.model_name}"
     print(f"\nSubmitting to: {repo_id}")
 
+    # Ensure id_to_token mapping is present for legal move masking
+    vocab = tokenizer.get_vocab()
+    max_id = max(vocab.values()) if vocab else -1
+    id_to_token = [tokenizer.unk_token] * (max_id + 1)
+    for token, idx in vocab.items():
+        if 0 <= idx <= max_id:
+            id_to_token[idx] = token
+    model.config.id_to_token = id_to_token
+    model.config.mask_illegal_moves = True
+
     # Create a temporary directory to prepare submission
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_path = Path(tmp_dir)

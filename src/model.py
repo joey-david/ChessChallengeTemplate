@@ -23,20 +23,21 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from src.utils import convert_extended_uci_to_uci, convert_uci_to_extended
 
+
 class ChessConfig(PretrainedConfig):
     """
     Configuration class for the Chess Transformer model.
-    
+
     This configuration is designed for a ~1M parameter model.
     Students can adjust these values to explore different architectures.
-    
+
     Parameter budget breakdown (with default values):
     - Embeddings (vocab): 1200 x 128 = 153,600
     - Position Embeddings: 256 x 128 = 32,768
     - Transformer Layers: 6 x ~120,000 = ~720,000
     - LM Head (with weight tying): 0 (shared with embeddings)
     - Total: ~906,000 parameters
-    
+
     Attributes:
         vocab_size: Size of the vocabulary (number of unique moves).
         n_embd: Embedding dimension (d_model).
@@ -49,10 +50,12 @@ class ChessConfig(PretrainedConfig):
         tie_weights: Whether to tie embedding and output weights.
         mask_illegal_moves: Whether to mask illegal moves at inference time.
         id_to_token: Optional ID-to-token list for move reconstruction.
+        legal_loss_weight: Weight for legality-aware auxiliary loss.
+        legal_loss_positions: Positions to apply legal loss ("last", "all", "random").
     """
-    
+
     model_type = "chess_transformer"
-    
+
     def __init__(
         self,
         vocab_size: int = 1200,
@@ -66,6 +69,8 @@ class ChessConfig(PretrainedConfig):
         tie_weights: bool = True,
         mask_illegal_moves: bool = True,
         id_to_token: Optional[List[str]] = None,
+        legal_loss_weight: float = 0.0,
+        legal_loss_positions: str = "last",
         pad_token_id: int = 0,
         bos_token_id: int = 1,
         eos_token_id: int = 2,
@@ -77,7 +82,7 @@ class ChessConfig(PretrainedConfig):
             eos_token_id=eos_token_id,
             **kwargs,
         )
-        
+
         self.vocab_size = vocab_size
         self.n_embd = n_embd
         self.n_layer = n_layer
@@ -89,6 +94,8 @@ class ChessConfig(PretrainedConfig):
         self.tie_weights = tie_weights
         self.mask_illegal_moves = mask_illegal_moves
         self.id_to_token = id_to_token
+        self.legal_loss_weight = legal_loss_weight
+        self.legal_loss_positions = legal_loss_positions
         # Inform HF base class about tying behavior
         self.tie_word_embeddings = bool(tie_weights)
 
@@ -96,27 +103,27 @@ class ChessConfig(PretrainedConfig):
 class MultiHeadAttention(nn.Module):
     """
     Multi-head self-attention module.
-    
+
     This is a standard scaled dot-product attention implementation
     with causal masking for autoregressive generation.
     """
-    
+
     def __init__(self, config: ChessConfig):
         super().__init__()
-        
+
         assert config.n_embd % config.n_head == 0, \
             f"n_embd ({config.n_embd}) must be divisible by n_head ({config.n_head})"
-        
+
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.head_dim = config.n_embd // config.n_head
-        
+
         # Combined QKV projection for efficiency
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-        
+
         self.dropout = nn.Dropout(config.dropout)
-        
+
         # Causal mask (will be created on first forward pass)
         self.register_buffer(
             "bias",
@@ -125,67 +132,67 @@ class MultiHeadAttention(nn.Module):
             ),
             persistent=False,
         )
-    
+
     def forward(
         self,
         x: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         batch_size, seq_len, _ = x.size()
-        
+
         # Compute Q, K, V
         qkv = self.c_attn(x)
         q, k, v = qkv.split(self.n_embd, dim=2)
-        
+
         # Reshape for multi-head attention
         q = q.view(batch_size, seq_len, self.n_head, self.head_dim).transpose(1, 2)
         k = k.view(batch_size, seq_len, self.n_head, self.head_dim).transpose(1, 2)
         v = v.view(batch_size, seq_len, self.n_head, self.head_dim).transpose(1, 2)
-        
+
         # Scaled dot-product attention
         attn_weights = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        
+
         # Apply causal mask
         causal_mask = self.bias[:, :, :seq_len, :seq_len]
         attn_weights = attn_weights.masked_fill(causal_mask == 0, float("-inf"))
-        
+
         # Apply attention mask (for padding)
         if attention_mask is not None:
             # attention_mask shape: (batch_size, seq_len) -> (batch_size, 1, 1, seq_len)
             attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
             attn_weights = attn_weights.masked_fill(attention_mask == 0, float("-inf"))
-        
+
         attn_weights = F.softmax(attn_weights, dim=-1)
         attn_weights = self.dropout(attn_weights)
-        
+
         # Apply attention to values
         attn_output = torch.matmul(attn_weights, v)
-        
+
         # Reshape back
         attn_output = attn_output.transpose(1, 2).contiguous().view(
             batch_size, seq_len, self.n_embd
         )
-        
+
         # Output projection
         attn_output = self.c_proj(attn_output)
-        
+
         return attn_output
 
 
 class FeedForward(nn.Module):
     """
     Feed-forward network (MLP) module.
-    
+
     Standard two-layer MLP with GELU activation.
     """
-    
+
     def __init__(self, config: ChessConfig):
         super().__init__()
-        
+
         self.c_fc = nn.Linear(config.n_embd, config.n_inner)
         self.c_proj = nn.Linear(config.n_inner, config.n_embd)
         self.dropout = nn.Dropout(config.dropout)
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.c_fc(x)
         x = F.gelu(x)
@@ -197,19 +204,19 @@ class FeedForward(nn.Module):
 class TransformerBlock(nn.Module):
     """
     A single transformer block with attention and feed-forward layers.
-    
+
     Uses pre-normalization (LayerNorm before attention/FFN) for better
     training stability.
     """
-    
+
     def __init__(self, config: ChessConfig):
         super().__init__()
-        
+
         self.ln_1 = nn.LayerNorm(config.n_embd, eps=config.layer_norm_epsilon)
         self.attn = MultiHeadAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd, eps=config.layer_norm_epsilon)
         self.mlp = FeedForward(config)
-    
+
     def forward(
         self,
         x: torch.Tensor,
@@ -225,17 +232,17 @@ class TransformerBlock(nn.Module):
 class ChessForCausalLM(PreTrainedModel):
     """
     Chess Transformer for Causal Language Modeling (next-move prediction).
-    
+
     This model is designed to predict the next chess move given a sequence
     of previous moves. It uses a GPT-style architecture with:
     - Token embeddings for chess moves
     - Learned positional embeddings
     - Stacked transformer blocks
     - Linear head for next-token prediction
-    
+
     The model supports weight tying between the embedding layer and the
     output projection to save parameters.
-    
+
     Example:
         >>> config = ChessConfig(vocab_size=1200, n_embd=128, n_layer=6)
         >>> model = ChessForCausalLM(config)
@@ -243,40 +250,40 @@ class ChessForCausalLM(PreTrainedModel):
         >>> outputs = model(**inputs)
         >>> next_move_logits = outputs.logits[:, -1, :]
     """
-    
+
     config_class = ChessConfig
     base_model_prefix = "transformer"
     supports_gradient_checkpointing = True
     # Suppress missing-key warning for tied lm_head when loading
     keys_to_ignore_on_load_missing = ["lm_head.weight"]
-    
+
     def __init__(self, config: ChessConfig):
         super().__init__(config)
-        
+
         # Token and position embeddings
         self.wte = nn.Embedding(config.vocab_size, config.n_embd)
         self.wpe = nn.Embedding(config.n_ctx, config.n_embd)
-        
+
         self.drop = nn.Dropout(config.dropout)
-        
+
         # Transformer blocks
         self.h = nn.ModuleList([
             TransformerBlock(config) for _ in range(config.n_layer)
         ])
-        
+
         # Final layer norm
         self.ln_f = nn.LayerNorm(config.n_embd, eps=config.layer_norm_epsilon)
-        
+
         # Output head
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        
+
         # Declare tied weights for proper serialization
         if config.tie_weights:
             self._tied_weights_keys = ["lm_head.weight"]
-        
+
         # Initialize weights
         self.post_init()
-        
+
         # Tie weights if configured
         if config.tie_weights:
             self.tie_weights()
@@ -322,16 +329,18 @@ class ChessForCausalLM(PreTrainedModel):
         board = chess.Board()
         seq_len = input_ids.size(0)
         if attention_mask is None:
-            mask = torch.ones(seq_len, dtype=torch.bool, device=input_ids.device)
+            active = torch.ones(seq_len, dtype=torch.bool, device=input_ids.device)
         else:
-            mask = attention_mask.to(dtype=torch.bool)
+            active = attention_mask.to(dtype=torch.bool)
 
         for idx in range(seq_len):
-            if not mask[idx]:
+            if not active[idx]:
                 continue
             token_id = int(input_ids[idx].item())
-            token = self._id_to_token[token_id] if token_id < len(self._id_to_token) else None
-            if token is None or not self._looks_like_move_token(token):
+            if token_id >= len(self._id_to_token):
+                continue
+            token = self._id_to_token[token_id]
+            if not self._looks_like_move_token(token):
                 continue
 
             uci_move = convert_extended_uci_to_uci(token)
@@ -345,6 +354,12 @@ class ChessForCausalLM(PreTrainedModel):
 
             board.push(move)
 
+        return self._get_legal_move_ids_from_board(board)
+
+    def _get_legal_move_ids_from_board(self, board) -> List[int]:
+        if self._token_to_id is None:
+            return []
+
         legal_ids: List[int] = []
         board_fen = board.fen()
         for move in board.legal_moves:
@@ -352,8 +367,90 @@ class ChessForCausalLM(PreTrainedModel):
             token_id = self._token_to_id.get(extended)
             if token_id is not None:
                 legal_ids.append(token_id)
-
         return legal_ids
+
+    def _compute_legal_loss(
+        self,
+        logits: torch.Tensor,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.Tensor],
+        labels: torch.LongTensor,
+    ) -> Optional[torch.Tensor]:
+        if self._id_to_token is None or self._token_to_id is None:
+            return None
+
+        try:
+            import chess
+        except ImportError:
+            return None
+
+        positions_mode = getattr(self.config, "legal_loss_positions", "last")
+        total_loss = logits.new_tensor(0.0)
+        total_count = 0
+
+        batch_size, seq_len, _ = logits.size()
+
+        for batch_idx in range(batch_size):
+            label_row = labels[batch_idx]
+            if attention_mask is None:
+                active = torch.ones(seq_len, dtype=torch.bool, device=labels.device)
+            else:
+                active = attention_mask[batch_idx].to(dtype=torch.bool)
+
+            valid_targets = [
+                idx for idx in range(1, seq_len)
+                if active[idx] and label_row[idx] != -100
+            ]
+            if not valid_targets:
+                continue
+
+            if positions_mode == "all":
+                target_indices = valid_targets
+            elif positions_mode == "random":
+                pick = torch.randint(0, len(valid_targets), (1,), device=labels.device).item()
+                target_indices = [valid_targets[pick]]
+            else:
+                target_indices = [valid_targets[-1]]
+
+            selected_preds = {idx - 1 for idx in target_indices}
+            board = chess.Board()
+
+            for pred_idx in range(seq_len - 1):
+                if not active[pred_idx]:
+                    break
+
+                token_id = int(input_ids[batch_idx, pred_idx].item())
+                if token_id < len(self._id_to_token):
+                    token = self._id_to_token[token_id]
+                    if self._looks_like_move_token(token):
+                        uci_move = convert_extended_uci_to_uci(token)
+                        try:
+                            move = chess.Move.from_uci(uci_move)
+                        except (ValueError, chess.InvalidMoveError):
+                            break
+
+                        if move not in board.legal_moves:
+                            break
+
+                        board.push(move)
+
+                if pred_idx in selected_preds:
+                    legal_ids = self._get_legal_move_ids_from_board(board)
+                    if not legal_ids:
+                        continue
+
+                    pos_logits = logits[batch_idx, pred_idx, :]
+                    legal_logits = pos_logits[legal_ids]
+                    log_prob_legal = (
+                        torch.logsumexp(legal_logits, dim=-1)
+                        - torch.logsumexp(pos_logits, dim=-1)
+                    )
+                    total_loss = total_loss + (-log_prob_legal)
+                    total_count += 1
+
+        if total_count == 0:
+            return None
+        return total_loss / total_count
 
     def get_input_embeddings(self) -> nn.Module:
         return self.wte
@@ -373,7 +470,7 @@ class ChessForCausalLM(PreTrainedModel):
         # Use HF helper to tie or clone depending on config
         if getattr(self.config, "tie_weights", False) or getattr(self.config, "tie_word_embeddings", False):
             self._tie_or_clone_weights(self.lm_head, self.wte)
-    
+
     def _init_weights(self, module: nn.Module):
         """Initialize weights following GPT-2 style."""
         if isinstance(module, nn.Linear):
@@ -385,7 +482,7 @@ class ChessForCausalLM(PreTrainedModel):
         elif isinstance(module, nn.LayerNorm):
             torch.nn.init.ones_(module.weight)
             torch.nn.init.zeros_(module.bias)
-    
+
     def forward(
         self,
         input_ids: torch.LongTensor,
@@ -397,38 +494,38 @@ class ChessForCausalLM(PreTrainedModel):
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         """
         Forward pass of the model.
-        
+
         Args:
             input_ids: Token IDs of shape (batch_size, seq_len).
             attention_mask: Attention mask of shape (batch_size, seq_len).
             position_ids: Position IDs of shape (batch_size, seq_len).
             labels: Labels for language modeling loss.
             return_dict: Whether to return a ModelOutput object.
-        
+
         Returns:
             CausalLMOutputWithPast containing loss (if labels provided) and logits.
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        
+
         batch_size, seq_len = input_ids.size()
         device = input_ids.device
-        
+
         # Create position IDs if not provided
         if position_ids is None:
             position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
-        
+
         # Get embeddings
         token_embeds = self.wte(input_ids)
         position_embeds = self.wpe(position_ids)
         hidden_states = self.drop(token_embeds + position_embeds)
-        
+
         # Pass through transformer blocks
         for block in self.h:
             hidden_states = block(hidden_states, attention_mask=attention_mask)
-        
+
         # Final layer norm
         hidden_states = self.ln_f(hidden_states)
-        
+
         # Get logits
         logits = self.lm_head(hidden_states)
 
@@ -453,25 +550,42 @@ class ChessForCausalLM(PreTrainedModel):
                 )
                 mask[allowed_ids] = 0.0
                 logits[batch_idx, -1, :] = logits[batch_idx, -1, :] + mask
-        
+
         # Compute loss if labels are provided
         loss = None
         if labels is not None:
             # Shift logits and labels for next-token prediction
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            
+
             # Flatten for cross-entropy
             loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
             loss = loss_fct(
                 shift_logits.view(-1, shift_logits.size(-1)),
                 shift_labels.view(-1),
             )
-        
+
+        if (
+            labels is not None
+            and self._id_to_token is not None
+            and self.config.legal_loss_weight > 0
+        ):
+            legal_loss = self._compute_legal_loss(
+                logits=logits,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+            )
+            if legal_loss is not None:
+                if loss is None:
+                    loss = self.config.legal_loss_weight * legal_loss
+                else:
+                    loss = loss + self.config.legal_loss_weight * legal_loss
+
         if not return_dict:
             output = (logits,)
             return ((loss,) + output) if loss is not None else output
-        
+
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
@@ -479,7 +593,7 @@ class ChessForCausalLM(PreTrainedModel):
             hidden_states=None,
             attentions=None,
         )
-    
+
     @torch.no_grad()
     def generate_move(
         self,
@@ -490,46 +604,46 @@ class ChessForCausalLM(PreTrainedModel):
     ) -> int:
         """
         Generate the next move given a sequence of moves.
-        
+
         Args:
             input_ids: Token IDs of shape (1, seq_len).
             temperature: Sampling temperature (1.0 = no change).
             top_k: If set, only sample from top k tokens.
             top_p: If set, use nucleus sampling with this threshold.
-        
+
         Returns:
             The token ID of the predicted next move.
         """
         self.eval()
-        
+
         # Get logits for the last position
         outputs = self(input_ids)
         logits = outputs.logits[:, -1, :] / temperature
-        
+
         # Apply top-k filtering
         if top_k is not None:
             indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
             logits[indices_to_remove] = float("-inf")
-        
+
         # Apply top-p (nucleus) filtering
         if top_p is not None:
             sorted_logits, sorted_indices = torch.sort(logits, descending=True)
             cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-            
+
             # Remove tokens with cumulative probability above the threshold
             sorted_indices_to_remove = cumulative_probs > top_p
             sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
             sorted_indices_to_remove[..., 0] = 0
-            
+
             indices_to_remove = sorted_indices_to_remove.scatter(
                 dim=-1, index=sorted_indices, src=sorted_indices_to_remove
             )
             logits[indices_to_remove] = float("-inf")
-        
+
         # Sample from the distribution
         probs = F.softmax(logits, dim=-1)
         next_token = torch.multinomial(probs, num_samples=1)
-        
+
         return next_token.item()
 
 
