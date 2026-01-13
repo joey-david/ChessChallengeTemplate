@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -21,6 +21,7 @@ import torch.nn.functional as F
 from transformers import PretrainedConfig, PreTrainedModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from src.utils import convert_extended_uci_to_uci, convert_uci_to_extended
 
 class ChessConfig(PretrainedConfig):
     """
@@ -46,6 +47,8 @@ class ChessConfig(PretrainedConfig):
         dropout: Dropout probability.
         layer_norm_epsilon: Epsilon for layer normalization.
         tie_weights: Whether to tie embedding and output weights.
+        mask_illegal_moves: Whether to mask illegal moves at inference time.
+        id_to_token: Optional ID-to-token list for move reconstruction.
     """
     
     model_type = "chess_transformer"
@@ -61,6 +64,8 @@ class ChessConfig(PretrainedConfig):
         dropout: float = 0.1,
         layer_norm_epsilon: float = 1e-5,
         tie_weights: bool = True,
+        mask_illegal_moves: bool = True,
+        id_to_token: Optional[List[str]] = None,
         pad_token_id: int = 0,
         bos_token_id: int = 1,
         eos_token_id: int = 2,
@@ -82,6 +87,8 @@ class ChessConfig(PretrainedConfig):
         self.dropout = dropout
         self.layer_norm_epsilon = layer_norm_epsilon
         self.tie_weights = tie_weights
+        self.mask_illegal_moves = mask_illegal_moves
+        self.id_to_token = id_to_token
         # Inform HF base class about tying behavior
         self.tie_word_embeddings = bool(tie_weights)
 
@@ -274,6 +281,80 @@ class ChessForCausalLM(PreTrainedModel):
         if config.tie_weights:
             self.tie_weights()
 
+        self._init_token_maps()
+
+    def _init_token_maps(self) -> None:
+        id_to_token = getattr(self.config, "id_to_token", None)
+        if not id_to_token:
+            self._id_to_token = None
+            self._token_to_id = None
+            self._move_token_ids = None
+            return
+
+        self._id_to_token = list(id_to_token)
+        self._token_to_id = {tok: idx for idx, tok in enumerate(self._id_to_token)}
+        self._move_token_ids = [
+            idx for idx, tok in enumerate(self._id_to_token)
+            if self._looks_like_move_token(tok)
+        ]
+
+    @staticmethod
+    def _looks_like_move_token(token: str) -> bool:
+        return (
+            len(token) >= 6
+            and token[0] in ("W", "B")
+            and token[1] in ("P", "N", "B", "R", "Q", "K")
+        )
+
+    def _get_legal_move_ids(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.Tensor],
+    ) -> List[int]:
+        if self._id_to_token is None or self._token_to_id is None:
+            return []
+
+        try:
+            import chess
+        except ImportError:
+            return []
+
+        board = chess.Board()
+        seq_len = input_ids.size(0)
+        if attention_mask is None:
+            mask = torch.ones(seq_len, dtype=torch.bool, device=input_ids.device)
+        else:
+            mask = attention_mask.to(dtype=torch.bool)
+
+        for idx in range(seq_len):
+            if not mask[idx]:
+                continue
+            token_id = int(input_ids[idx].item())
+            token = self._id_to_token[token_id] if token_id < len(self._id_to_token) else None
+            if token is None or not self._looks_like_move_token(token):
+                continue
+
+            uci_move = convert_extended_uci_to_uci(token)
+            try:
+                move = chess.Move.from_uci(uci_move)
+            except (ValueError, chess.InvalidMoveError):
+                break
+
+            if move not in board.legal_moves:
+                break
+
+            board.push(move)
+
+        legal_ids: List[int] = []
+        board_fen = board.fen()
+        for move in board.legal_moves:
+            extended = convert_uci_to_extended(move.uci(), board_fen)
+            token_id = self._token_to_id.get(extended)
+            if token_id is not None:
+                legal_ids.append(token_id)
+
+        return legal_ids
+
     def get_input_embeddings(self) -> nn.Module:
         return self.wte
 
@@ -350,6 +431,28 @@ class ChessForCausalLM(PreTrainedModel):
         
         # Get logits
         logits = self.lm_head(hidden_states)
+
+        if (
+            self.config.mask_illegal_moves
+            and not self.training
+            and labels is None
+            and self._id_to_token is not None
+        ):
+            logits = logits.clone()
+            for batch_idx in range(batch_size):
+                allowed_ids = self._get_legal_move_ids(
+                    input_ids[batch_idx],
+                    attention_mask[batch_idx] if attention_mask is not None else None,
+                )
+                if not allowed_ids:
+                    continue
+                mask = torch.full(
+                    (logits.size(-1),),
+                    float("-inf"),
+                    device=logits.device,
+                )
+                mask[allowed_ids] = 0.0
+                logits[batch_idx, -1, :] = logits[batch_idx, -1, :] + mask
         
         # Compute loss if labels are provided
         loss = None

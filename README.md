@@ -65,11 +65,7 @@ python -m src.evaluate \
     --n_positions 500
 
 # Phase 2: Win Rate Evaluation (full games against Stockfish)
-python -m src.evaluate \
-    --model_path ./my_model/final_model \
-    --mode winrate \
-    --n_games 100 \
-    --stockfish_level 1
+
 
 # Or run both phases:
 python -m src.evaluate \

@@ -1,13 +1,14 @@
 """
 Custom Chess Tokenizer for the Chess Challenge.
 
-This tokenizer treats each move as a single token using the extended UCI notation
-from the Lichess dataset (e.g., WPe2e4, BNg8f6).
+This tokenizer supports move-level tokens by default, with an optional
+structured split mode for experiments.
 
 The dataset format uses:
 - W/B prefix for White/Black
 - Piece letter: P=Pawn, N=Knight, B=Bishop, R=Rook, Q=Queen, K=King
 - Source and destination squares (e.g., e2e4)
+- Promotions: =Q, =R, =B, =N
 - Special suffixes: (x)=capture, (+)=check, (+*)=checkmate, (o)/(O)=castling
 """
 
@@ -16,7 +17,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from transformers import PreTrainedTokenizer
 
@@ -25,14 +26,13 @@ class ChessTokenizer(PreTrainedTokenizer):
     """
     A custom tokenizer for chess moves using extended UCI notation.
     
-    This tokenizer maps each possible chess move to a unique token ID.
-    The vocabulary is built from the training dataset to ensure all moves
-    encountered during training have a corresponding token.
+    This tokenizer maps each chess move to a token by default. In split mode,
+    each move is encoded as a fixed sequence of structured sub-tokens.
     
     Example:
         >>> tokenizer = ChessTokenizer()
         >>> tokenizer.encode("WPe2e4 BPe7e5")
-        [1, 42, 87, 2]  # [BOS, e2e4, e7e5, EOS]
+        [1, 42, 87, 2]  # [BOS, WPe2e4, BPe7e5, EOS]
     """
     
     model_input_names = ["input_ids", "attention_mask"]
@@ -43,11 +43,78 @@ class ChessTokenizer(PreTrainedTokenizer):
     BOS_TOKEN = "[BOS]"
     EOS_TOKEN = "[EOS]"
     UNK_TOKEN = "[UNK]"
+
+    # Structured move tokens
+    COLOR_TOKENS = ["C_W", "C_B"]
+    PIECE_TOKENS = ["PIECE_P", "PIECE_N", "PIECE_B", "PIECE_R", "PIECE_Q", "PIECE_K"]
+    SQUARE_TOKENS = [
+        f"SQ_{file}{rank}" for file in "abcdefgh" for rank in "12345678"
+    ]
+    PROMO_TOKENS = ["PROMO_NONE", "PROMO_Q", "PROMO_R", "PROMO_B", "PROMO_N"]
+    SUFFIX_TOKENS = [
+        "SUF_NONE",
+        "SUF_X",
+        "SUF_PLUS",
+        "SUF_MATE",
+        "SUF_XPLUS",
+        "SUF_XMATE",
+        "SUF_O",
+        "SUF_OO",
+    ]
+
+    _COLOR_TOKEN_MAP = {"W": "C_W", "B": "C_B"}
+    _PIECE_TOKEN_MAP = {
+        "P": "PIECE_P",
+        "N": "PIECE_N",
+        "B": "PIECE_B",
+        "R": "PIECE_R",
+        "Q": "PIECE_Q",
+        "K": "PIECE_K",
+    }
+    _PROMO_TOKEN_MAP = {
+        None: "PROMO_NONE",
+        "Q": "PROMO_Q",
+        "R": "PROMO_R",
+        "B": "PROMO_B",
+        "N": "PROMO_N",
+    }
+    _SUFFIX_TOKEN_MAP = {
+        None: "SUF_NONE",
+        "": "SUF_NONE",
+        "x": "SUF_X",
+        "+": "SUF_PLUS",
+        "+*": "SUF_MATE",
+        "x+": "SUF_XPLUS",
+        "x+*": "SUF_XMATE",
+        "o": "SUF_O",
+        "O": "SUF_OO",
+    }
+
+    _TOKEN_TO_COLOR = {v: k for k, v in _COLOR_TOKEN_MAP.items()}
+    _TOKEN_TO_PIECE = {v: k for k, v in _PIECE_TOKEN_MAP.items()}
+    _TOKEN_TO_PROMO = {
+        "PROMO_NONE": "",
+        "PROMO_Q": "=Q",
+        "PROMO_R": "=R",
+        "PROMO_B": "=B",
+        "PROMO_N": "=N",
+    }
+    _TOKEN_TO_SUFFIX = {
+        "SUF_NONE": "",
+        "SUF_X": "(x)",
+        "SUF_PLUS": "(+)",
+        "SUF_MATE": "(+*)",
+        "SUF_XPLUS": "(x+)",
+        "SUF_XMATE": "(x+*)",
+        "SUF_O": "(o)",
+        "SUF_OO": "(O)",
+    }
     
     def __init__(
         self,
         vocab_file: Optional[str] = None,
         vocab: Optional[Dict[str, int]] = None,
+        split_moves: bool = False,
         **kwargs,
     ):
         """
@@ -63,6 +130,7 @@ class ChessTokenizer(PreTrainedTokenizer):
         self._bos_token = self.BOS_TOKEN
         self._eos_token = self.EOS_TOKEN
         self._unk_token = self.UNK_TOKEN
+        self._split_moves = split_moves
 
         # Remove any duplicate special-token entries passed through kwargs
         # to avoid "multiple values for keyword" errors when loading from disk.
@@ -70,6 +138,7 @@ class ChessTokenizer(PreTrainedTokenizer):
         kwargs.pop("bos_token", None)
         kwargs.pop("eos_token", None)
         kwargs.pop("unk_token", None)
+        kwargs.pop("split_moves", None)
         
         # Load or create vocabulary
         if vocab is not None:
@@ -91,6 +160,7 @@ class ChessTokenizer(PreTrainedTokenizer):
             bos_token=self._bos_token,
             eos_token=self._eos_token,
             unk_token=self._unk_token,
+            split_moves=split_moves,
             **kwargs,
         )
     
@@ -104,12 +174,67 @@ class ChessTokenizer(PreTrainedTokenizer):
         special_tokens = [self.PAD_TOKEN, self.BOS_TOKEN, self.EOS_TOKEN, self.UNK_TOKEN]
         vocab = {token: idx for idx, token in enumerate(special_tokens)}
         return vocab
+
+    @classmethod
+    def _get_base_tokens(cls) -> List[str]:
+        return (
+            cls.COLOR_TOKENS
+            + cls.PIECE_TOKENS
+            + cls.SQUARE_TOKENS
+            + cls.PROMO_TOKENS
+            + cls.SUFFIX_TOKENS
+        )
+
+    @classmethod
+    def _split_move(
+        cls,
+        move: str,
+    ) -> Optional[Tuple[str, str, str, str, Optional[str], Optional[str]]]:
+        if len(move) < 6:
+            return None
+
+        color = move[0]
+        piece = move[1]
+        from_sq = move[2:4]
+        to_sq = move[4:6]
+        rest = move[6:]
+
+        if color not in cls._COLOR_TOKEN_MAP:
+            return None
+        if piece not in cls._PIECE_TOKEN_MAP:
+            return None
+        if f"SQ_{from_sq}" not in cls.SQUARE_TOKENS:
+            return None
+        if f"SQ_{to_sq}" not in cls.SQUARE_TOKENS:
+            return None
+
+        promo = None
+        suffix = None
+        if rest:
+            if rest.startswith("="):
+                if len(rest) < 2:
+                    return None
+                promo = rest[1]
+                rest = rest[2:]
+            if rest:
+                if rest.startswith("(") and rest.endswith(")"):
+                    suffix = rest[1:-1]
+                else:
+                    return None
+
+        if promo is not None and promo not in cls._PROMO_TOKEN_MAP:
+            return None
+        if suffix is not None and suffix not in cls._SUFFIX_TOKEN_MAP:
+            return None
+
+        return color, piece, from_sq, to_sq, promo, suffix
     
     @classmethod
     def build_vocab_from_iterator(
         cls,
         iterator,
         min_frequency: int = 1,
+        split_moves: bool = False,
     ) -> "ChessTokenizer":
         """
         Build a tokenizer vocabulary from an iterator of game strings.
@@ -124,25 +249,48 @@ class ChessTokenizer(PreTrainedTokenizer):
         from collections import Counter
         
         token_counts = Counter()
-        
-        for game in iterator:
-            moves = game.strip().split()
-            token_counts.update(moves)
+
+        if split_moves:
+            base_tokens = cls._get_base_tokens()
+            for game in iterator:
+                moves = game.strip().split()
+                for move in moves:
+                    move_parts = cls._split_move(move)
+                    if move_parts is None:
+                        token_counts.update([cls.UNK_TOKEN])
+                        continue
+                    color, piece, from_sq, to_sq, promo, suffix = move_parts
+                    token_counts.update([
+                        cls._COLOR_TOKEN_MAP[color],
+                        cls._PIECE_TOKEN_MAP[piece],
+                        f"SQ_{from_sq}",
+                        f"SQ_{to_sq}",
+                        cls._PROMO_TOKEN_MAP[promo],
+                        cls._SUFFIX_TOKEN_MAP[suffix],
+                    ])
+        else:
+            for game in iterator:
+                moves = game.strip().split()
+                token_counts.update(moves)
         
         # Filter by frequency
         tokens = [
             token for token, count in token_counts.items()
             if count >= min_frequency
         ]
-        
-        # Sort for reproducibility
-        tokens = sorted(tokens)
-        
+
         # Build vocabulary
         special_tokens = [cls.PAD_TOKEN, cls.BOS_TOKEN, cls.EOS_TOKEN, cls.UNK_TOKEN]
-        vocab = {token: idx for idx, token in enumerate(special_tokens + tokens)}
+        if split_moves:
+            base_tokens = cls._get_base_tokens()
+            extra_tokens = sorted(t for t in tokens if t not in base_tokens)
+            full_tokens = base_tokens + extra_tokens
+            vocab_tokens = special_tokens + full_tokens
+        else:
+            vocab_tokens = special_tokens + sorted(tokens)
+        vocab = {token: idx for idx, token in enumerate(vocab_tokens)}
         
-        return cls(vocab=vocab)
+        return cls(vocab=vocab, split_moves=split_moves)
     
     @classmethod
     def build_vocab_from_dataset(
@@ -152,6 +300,7 @@ class ChessTokenizer(PreTrainedTokenizer):
         column: str = "text",
         min_frequency: int = 500,
         max_samples: Optional[int] = 100000,
+        split_moves: bool = False,
     ) -> "ChessTokenizer":
         """
         Build a tokenizer vocabulary from a Hugging Face dataset.
@@ -177,7 +326,11 @@ class ChessTokenizer(PreTrainedTokenizer):
             for example in dataset:
                 yield example[column]
         
-        return cls.build_vocab_from_iterator(game_iterator(), min_frequency=min_frequency)
+        return cls.build_vocab_from_iterator(
+            game_iterator(),
+            min_frequency=min_frequency,
+            split_moves=split_moves,
+        )
     
     @property
     def vocab_size(self) -> int:
@@ -198,7 +351,35 @@ class ChessTokenizer(PreTrainedTokenizer):
         Returns:
             List of move tokens.
         """
-        return text.strip().split()
+        if not text:
+            return []
+
+        raw_tokens = text.strip().split()
+        if not self._split_moves:
+            return raw_tokens
+
+        tokens: List[str] = []
+        for raw in raw_tokens:
+            if raw in {self.PAD_TOKEN, self.BOS_TOKEN, self.EOS_TOKEN, self.UNK_TOKEN}:
+                tokens.append(raw)
+                continue
+
+            move_parts = self._split_move(raw)
+            if move_parts is None:
+                tokens.append(self.UNK_TOKEN)
+                continue
+
+            color, piece, from_sq, to_sq, promo, suffix = move_parts
+            tokens.extend([
+                self._COLOR_TOKEN_MAP[color],
+                self._PIECE_TOKEN_MAP[piece],
+                f"SQ_{from_sq}",
+                f"SQ_{to_sq}",
+                self._PROMO_TOKEN_MAP[promo],
+                self._SUFFIX_TOKEN_MAP[suffix],
+            ])
+
+        return tokens
     
     def _convert_token_to_id(self, token: str) -> int:
         """Convert a token to its ID."""
@@ -210,9 +391,44 @@ class ChessTokenizer(PreTrainedTokenizer):
     
     def convert_tokens_to_string(self, tokens: List[str]) -> str:
         """Convert a list of tokens back to a string."""
-        # Filter out special tokens for cleaner output
         special = {self.PAD_TOKEN, self.BOS_TOKEN, self.EOS_TOKEN, self.UNK_TOKEN}
-        return " ".join(t for t in tokens if t not in special)
+        filtered = [t for t in tokens if t not in special]
+
+        if not self._split_moves:
+            return " ".join(filtered)
+
+        moves: List[str] = []
+        i = 0
+        while i + 5 < len(filtered):
+            color_tok = filtered[i]
+            piece_tok = filtered[i + 1]
+            from_tok = filtered[i + 2]
+            to_tok = filtered[i + 3]
+            promo_tok = filtered[i + 4]
+            suffix_tok = filtered[i + 5]
+
+            if (
+                color_tok not in self._TOKEN_TO_COLOR
+                or piece_tok not in self._TOKEN_TO_PIECE
+                or not from_tok.startswith("SQ_")
+                or not to_tok.startswith("SQ_")
+                or promo_tok not in self._TOKEN_TO_PROMO
+                or suffix_tok not in self._TOKEN_TO_SUFFIX
+            ):
+                i += 1
+                continue
+
+            color = self._TOKEN_TO_COLOR[color_tok]
+            piece = self._TOKEN_TO_PIECE[piece_tok]
+            from_sq = from_tok.replace("SQ_", "", 1)
+            to_sq = to_tok.replace("SQ_", "", 1)
+            promo = self._TOKEN_TO_PROMO[promo_tok]
+            suffix = self._TOKEN_TO_SUFFIX[suffix_tok]
+
+            moves.append(f"{color}{piece}{from_sq}{to_sq}{promo}{suffix}")
+            i += 6
+
+        return " ".join(moves)
     
     def save_vocabulary(
         self,
@@ -239,8 +455,35 @@ class ChessTokenizer(PreTrainedTokenizer):
         
         with open(vocab_file, "w", encoding="utf-8") as f:
             json.dump(self._vocab, f, ensure_ascii=False, indent=2)
+
+        self._update_model_config_vocab(save_directory)
         
         return (vocab_file,)
+
+    def _update_model_config_vocab(self, save_directory: str) -> None:
+        config_path = os.path.join(save_directory, "config.json")
+        if not os.path.exists(config_path):
+            return
+
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                config_data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return
+
+        max_id = max(self._vocab.values(), default=-1)
+        id_to_token = [self.UNK_TOKEN] * (max_id + 1)
+        for token, idx in self._vocab.items():
+            if 0 <= idx <= max_id:
+                id_to_token[idx] = token
+
+        config_data["id_to_token"] = id_to_token
+
+        try:
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(config_data, f, ensure_ascii=False, indent=2)
+        except OSError:
+            return
 
 
 def count_vocab_from_dataset(
