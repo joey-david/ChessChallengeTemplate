@@ -77,6 +77,22 @@ python -m src.evaluate \
     --mode both
 ```
 
+### GRPO Reinforcement Learning
+
+You can fine-tune a trained baseline with Stockfish-guided rewards using `RL.py`:
+
+```bash
+python RL.py \
+    --model_path ./my_model/final_model \
+    --output_dir ./rl_model \
+    --stockfish_path /path/to/stockfish \
+    --steps 500 \
+    --batch_size 8 \
+    --group_size 4
+```
+
+This requires `python-chess` and a Stockfish binary on your PATH (or `--stockfish_path`).
+
 ## Parameter Budget
 
 Use the utility function to check your budget:
