@@ -759,13 +759,16 @@ def load_model_from_hub(model_id: str, device: str = "auto"):
     
     # Import to register custom classes
     from src.model import ChessConfig, ChessForCausalLM
-    from src.tokenizer import ChessTokenizer
+    from src.tokenizer import ChessSquaresTokenizer, ChessTokenizer
     
     # Try loading with custom tokenizer first, fall back to AutoTokenizer
     try:
-        tokenizer = ChessTokenizer.from_pretrained(model_id)
+        tokenizer = ChessSquaresTokenizer.from_pretrained(model_id)
     except Exception:
-        tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+        try:
+            tokenizer = ChessTokenizer.from_pretrained(model_id)
+        except Exception:
+            tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
@@ -824,10 +827,12 @@ def main():
     if is_local_path:
         # Local path
         from transformers import AutoModelForCausalLM
-        from src.tokenizer import ChessTokenizer
+        from src.tokenizer import ChessSquaresTokenizer, ChessTokenizer
         from src.model import ChessConfig, ChessForCausalLM
-        
-        tokenizer = ChessTokenizer.from_pretrained(args.model_path)
+        try:
+            tokenizer = ChessSquaresTokenizer.from_pretrained(args.model_path)
+        except Exception:
+            tokenizer = ChessTokenizer.from_pretrained(args.model_path)
         model = AutoModelForCausalLM.from_pretrained(args.model_path)
     else:
         # Assume Hugging Face model ID (or invalid path)

@@ -56,12 +56,15 @@ def main():
 
     # Import custom classes to register them
     from src.model import ChessConfig, ChessForCausalLM
-    from src.tokenizer import ChessTokenizer
+    from src.tokenizer import ChessSquaresTokenizer, ChessTokenizer
 
     # Load model and tokenizer
     print(f"\nLoading model from: {args.model_path}")
     model = AutoModelForCausalLM.from_pretrained(args.model_path)
-    tokenizer = ChessTokenizer.from_pretrained(args.model_path)
+    try:
+        tokenizer = ChessSquaresTokenizer.from_pretrained(args.model_path)
+    except Exception:
+        tokenizer = ChessTokenizer.from_pretrained(args.model_path)
 
     if not getattr(model.config, "mask_invalid_moves", False):
         model.config.mask_invalid_moves = True
