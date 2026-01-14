@@ -150,15 +150,23 @@ def main():
     )
     print(f"   Vocabulary size: {tokenizer.vocab_size}")
     
-    # Use the full tokenizer size (includes any added special tokens)
-    actual_vocab_size = len(tokenizer)
+    # Use the highest token id + 1 to avoid out-of-range labels
+    vocab_ids = tokenizer.get_vocab().values()
+    actual_vocab_size = (max(vocab_ids) + 1) if vocab_ids else len(tokenizer)
     
     # Create model configuration
     print("\nCreating model configuration...")
-    token_texts = [
-        tokenizer.decode([token_id], clean_up_tokenization_spaces=False)
-        for token_id in range(len(tokenizer))
-    ]
+    token_texts = []
+    for token_id in range(actual_vocab_size):
+        try:
+            token_text = tokenizer.decode(
+                [token_id],
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )
+        except Exception:
+            token_text = ""
+        token_texts.append(token_text)
     config = ChessConfig(
         vocab_size=actual_vocab_size,
         n_embd=args.n_embd,

@@ -63,6 +63,25 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(args.model_path)
     tokenizer = ChessTokenizer.from_pretrained(args.model_path)
 
+    if not getattr(model.config, "mask_invalid_moves", False):
+        model.config.mask_invalid_moves = True
+
+    vocab_size = getattr(model.config, "vocab_size", tokenizer.vocab_size)
+    token_texts = getattr(model.config, "id_to_token_text", None)
+    if not token_texts or len(token_texts) != vocab_size:
+        token_texts = []
+        for token_id in range(vocab_size):
+            try:
+                token_text = tokenizer.decode(
+                    [token_id],
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                )
+            except Exception:
+                token_text = ""
+            token_texts.append(token_text)
+        model.config.id_to_token_text = token_texts
+
     # Count parameters
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {n_params:,}")
