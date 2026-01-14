@@ -9,6 +9,7 @@ This module provides helper functions for:
 
 from __future__ import annotations
 
+import re
 from typing import Dict, Optional, TYPE_CHECKING
 
 import torch.nn as nn
@@ -210,6 +211,77 @@ def validate_move_with_chess(move: str, board_fen: Optional[str] = None) -> bool
         return move_obj in board.legal_moves
     except (ValueError, chess.InvalidMoveError):
         return False
+
+
+MOVE_SUFFIXES = ("(x)", "(+)", "(+*)", "(x+)", "(x+*)", "(o)", "(O)")
+MOVE_REGEX = re.compile(
+    r"^[WB][PNBRQK][a-h][1-8][a-h][1-8](?:=[QRBN])?(?:"
+    r"\(x\)|\(\+\)|\(\+\*\)|\(x\+\)|\(x\+\*\)|\(o\)|\(O\)"
+    r")?$"
+)
+
+
+def is_valid_move_prefix(prefix: str) -> bool:
+    if prefix == "":
+        return True
+    if prefix[0] not in "WB":
+        return False
+    if len(prefix) == 1:
+        return True
+    if prefix[1] not in "PNBRQK":
+        return False
+    if len(prefix) == 2:
+        return True
+    if prefix[2] not in "abcdefgh":
+        return False
+    if len(prefix) == 3:
+        return True
+    if prefix[3] not in "12345678":
+        return False
+    if len(prefix) == 4:
+        return True
+    if prefix[4] not in "abcdefgh":
+        return False
+    if len(prefix) == 5:
+        return True
+    if prefix[5] not in "12345678":
+        return False
+    if len(prefix) == 6:
+        return True
+
+    suffix = prefix[6:]
+    if suffix.startswith("="):
+        if len(suffix) == 1:
+            return True
+        if suffix[1] not in "QRBN":
+            return False
+        if len(suffix) == 2:
+            return True
+        suffix = suffix[2:]
+
+    if suffix == "":
+        return True
+    for allowed in MOVE_SUFFIXES:
+        if allowed.startswith(suffix):
+            return True
+    return False
+
+
+def is_complete_move(move: str) -> bool:
+    return MOVE_REGEX.fullmatch(move) is not None
+
+
+def append_token_to_move_prefix(prefix: str, token_text: str) -> Optional[str]:
+    if prefix == "":
+        token_text = token_text.lstrip()
+    if not token_text:
+        return None
+    if re.search(r"\s", token_text):
+        return None
+    candidate = prefix + token_text
+    if not is_valid_move_prefix(candidate):
+        return None
+    return candidate
 
 
 def convert_extended_uci_to_uci(move: str) -> str:

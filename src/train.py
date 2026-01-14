@@ -32,8 +32,8 @@ def parse_args():
     
     # Model arguments
     parser.add_argument(
-        "--vocab_size", type=int, default=1200,
-        help="Vocabulary size"
+        "--vocab_size", type=int, default=1000,
+        help="Vocabulary size (overridden by tokenizer)"
     )
     parser.add_argument(
         "--n_embd", type=int, default=128,
@@ -140,12 +140,13 @@ def main():
     print("CHESS CHALLENGE - TRAINING")
     print("=" * 60)
     
-    # Build tokenizer from dataset
+    # Build tokenizer from dataset (fixed BPE vocab size)
     print("\nBuilding tokenizer from dataset...")
     tokenizer = ChessTokenizer.build_vocab_from_dataset(
         dataset_name=args.dataset_name,
-        min_frequency=500,  # Only keep moves that appear at least 500 times
-        max_samples=100000,  # Use 100k games to build vocabulary
+        vocab_size=1000,
+        min_frequency=2,
+        max_samples=None,
     )
     print(f"   Vocabulary size: {tokenizer.vocab_size}")
     
