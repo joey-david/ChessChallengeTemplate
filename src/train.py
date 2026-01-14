@@ -150,8 +150,8 @@ def main():
     )
     print(f"   Vocabulary size: {tokenizer.vocab_size}")
     
-    # Use the vocab size from tokenizer (override args if provided)
-    actual_vocab_size = tokenizer.vocab_size
+    # Use the full tokenizer size (includes any added special tokens)
+    actual_vocab_size = len(tokenizer)
     
     # Create model configuration
     print("\nCreating model configuration...")
