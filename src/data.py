@@ -13,6 +13,21 @@ import torch
 from torch.utils.data import Dataset
 
 
+def convert_game_to_square_tokens(game: str) -> str:
+    moves = game.strip().split()
+    square_tokens: List[str] = []
+    for move in moves:
+        if len(move) < 6:
+            continue
+        square_tokens.append(move[2:4])
+        square_tokens.append(move[4:6])
+        if "=" in move:
+            promo_idx = move.index("=")
+            if promo_idx + 1 < len(move):
+                square_tokens.append(move[promo_idx + 1].lower())
+    return " ".join(square_tokens)
+
+
 class ChessDataset(Dataset):
     """
     PyTorch Dataset for chess games.
@@ -70,6 +85,9 @@ class ChessDataset(Dataset):
     
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         game = self.data[idx][self.column]
+
+        if getattr(self.tokenizer, "is_square_tokenizer", False):
+            game = convert_game_to_square_tokens(game)
         
         # Prepend BOS token for proper language modeling
         game_with_bos = self.tokenizer.bos_token + " " + game

@@ -20,7 +20,7 @@ from transformers import (
 
 from src.data import ChessDataCollator, create_train_val_datasets
 from src.model import ChessConfig, ChessForCausalLM
-from src.tokenizer import ChessTokenizer
+from src.tokenizer import ChessSquaresTokenizer, ChessTokenizer
 from src.utils import count_parameters, print_parameter_budget
 
 
@@ -140,14 +140,9 @@ def main():
     print("CHESS CHALLENGE - TRAINING")
     print("=" * 60)
     
-    # Build tokenizer from dataset (fixed BPE vocab size)
-    print("\nBuilding tokenizer from dataset...")
-    tokenizer = ChessTokenizer.build_vocab_from_dataset(
-        dataset_name=args.dataset_name,
-        vocab_size=1000,
-        min_frequency=2,
-        max_samples=None,
-    )
+    # Build tokenizer
+    print("\nBuilding tokenizer...")
+    tokenizer = ChessSquaresTokenizer()
     print(f"   Vocabulary size: {tokenizer.vocab_size}")
     
     # Use the highest token id + 1 to avoid out-of-range labels
