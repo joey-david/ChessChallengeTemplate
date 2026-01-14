@@ -12,6 +12,7 @@ import argparse
 import os
 import random
 import time
+from collections import deque
 from typing import List, Optional, Tuple
 
 import torch
@@ -62,6 +63,30 @@ def parse_args() -> argparse.Namespace:
     # Stockfish settings
     parser.add_argument("--stockfish_path", type=str, default=None, help="Path to Stockfish")
     parser.add_argument("--stockfish_level", type=int, default=5, help="Stockfish skill (0-20)")
+    parser.add_argument(
+        "--stockfish_level_max",
+        type=int,
+        default=None,
+        help="Max Stockfish skill to ramp up to (enables auto progression)",
+    )
+    parser.add_argument(
+        "--stockfish_level_every_seconds",
+        type=int,
+        default=0,
+        help="Increase Stockfish skill by 1 every N seconds (0 disables)",
+    )
+    parser.add_argument(
+        "--stockfish_level_loss_rate",
+        type=float,
+        default=None,
+        help="Increase Stockfish skill when recent loss rate is below this value (0-1).",
+    )
+    parser.add_argument(
+        "--stockfish_level_window",
+        type=int,
+        default=256,
+        help="Number of recent samples to use for loss-rate ramping.",
+    )
     parser.add_argument(
         "--engine_time",
         type=float,
@@ -224,14 +249,14 @@ def evaluate_move_reward(
     legal_bonus: float,
     illegal_penalty: float,
     use_best_move_baseline: bool,
-) -> Tuple[float, bool]:
+) -> Tuple[float, bool, Optional[float]]:
     try:
         move = chess.Move.from_uci(move_uci)
     except ValueError:
-        return illegal_penalty, False
+        return illegal_penalty, False, None
 
     if move not in board.legal_moves:
-        return illegal_penalty, False
+        return illegal_penalty, False, None
 
     color = board.turn
     board_after = board.copy()
@@ -253,7 +278,7 @@ def evaluate_move_reward(
         score_best = max(min(score_best, cp_clip), -cp_clip)
         reward = legal_bonus + ((score_after - score_best) / cp_scale)
 
-    return reward, True
+    return reward, True, score_after
 
 
 def main() -> None:
@@ -261,13 +286,36 @@ def main() -> None:
     set_seed(args.seed)
     rng = random.Random(args.seed)
 
+    if (
+        args.stockfish_level_max is not None
+        and args.stockfish_level_every_seconds <= 0
+        and args.stockfish_level_loss_rate is None
+    ):
+        raise ValueError(
+            "--stockfish_level_max requires --stockfish_level_every_seconds > 0 "
+            "or --stockfish_level_loss_rate"
+        )
+    if args.stockfish_level_loss_rate is not None:
+        if not (0.0 < args.stockfish_level_loss_rate < 1.0):
+            raise ValueError("--stockfish_level_loss_rate must be between 0 and 1")
+        if args.stockfish_level_window <= 0:
+            raise ValueError("--stockfish_level_window must be > 0")
+        if args.stockfish_level_every_seconds > 0:
+            raise ValueError("--stockfish_level_loss_rate is incompatible with --stockfish_level_every_seconds")
+
     model, tokenizer = load_model_and_tokenizer(args.model_path, args.device)
     ref_model, _ = load_model_and_tokenizer(args.model_path, args.device)
     ref_model.eval()
     for param in ref_model.parameters():
         param.requires_grad = False
 
-    engine, chess = build_stockfish_engine(args.stockfish_path, args.stockfish_level)
+    current_stockfish_level = max(0, min(20, args.stockfish_level))
+    max_stockfish_level = (
+        max(0, min(20, args.stockfish_level_max))
+        if args.stockfish_level_max is not None
+        else current_stockfish_level
+    )
+    engine, chess = build_stockfish_engine(args.stockfish_path, current_stockfish_level)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
 
@@ -280,7 +328,18 @@ def main() -> None:
 
     max_length = max(1, model.config.n_ctx - 1)
 
-    last_save_time = time.time()
+    start_time = time.time()
+    last_save_time = start_time
+    next_level_update = (
+        start_time + args.stockfish_level_every_seconds
+        if args.stockfish_level_every_seconds > 0 and current_stockfish_level < max_stockfish_level
+        else None
+    )
+    loss_window = (
+        deque(maxlen=args.stockfish_level_window)
+        if args.stockfish_level_loss_rate is not None and current_stockfish_level < max_stockfish_level
+        else None
+    )
 
     for step in range(1, args.steps + 1):
         optimizer.zero_grad()
@@ -350,8 +409,9 @@ def main() -> None:
                     if move_uci is None:
                         reward = args.illegal_penalty
                         legal = False
+                        score_after = None
                     else:
-                        reward, legal = evaluate_move_reward(
+                        reward, legal, score_after = evaluate_move_reward(
                             board=board,
                             move_uci=move_uci,
                             engine=engine,
@@ -366,6 +426,9 @@ def main() -> None:
                         )
                     sample_rewards[i, j] = reward
                     sample_illegal[i, j] = 0.0 if legal else 1.0
+                    if loss_window is not None:
+                        is_loss = (not legal) or (score_after is None) or (score_after < 0)
+                        loss_window.append(1.0 if is_loss else 0.0)
 
             advantages = torch.zeros_like(sample_rewards)
             for i in range(args.batch_size):
@@ -392,6 +455,25 @@ def main() -> None:
             step_samples += args.batch_size * args.group_size
             step_illegal += int(illegal_device.sum().item())
             step_reward += float(rewards_device.sum().item())
+
+        if next_level_update is not None:
+            now = time.time()
+            if now >= next_level_update:
+                while next_level_update <= now and current_stockfish_level < max_stockfish_level:
+                    current_stockfish_level += 1
+                    engine.configure({"Skill Level": current_stockfish_level})
+                    next_level_update += args.stockfish_level_every_seconds
+                print(f"updated stockfish_level={current_stockfish_level}")
+        if loss_window is not None and len(loss_window) == loss_window.maxlen:
+            loss_rate = sum(loss_window) / len(loss_window)
+            if loss_rate <= args.stockfish_level_loss_rate and current_stockfish_level < max_stockfish_level:
+                current_stockfish_level += 1
+                engine.configure({"Skill Level": current_stockfish_level})
+                loss_window.clear()
+                print(
+                    f"updated stockfish_level={current_stockfish_level} "
+                    f"(loss_rate={loss_rate:.2%})"
+                )
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
         optimizer.step()
