@@ -57,8 +57,6 @@ class ChessEvaluator:
         self.tokenizer = tokenizer
         self.max_retries = max_retries
         self.device = device
-        self._token_texts: Optional[List[str]] = None
-        self._special_token_ids: Optional[set] = None
         
         # Initialize Stockfish
         try:
@@ -150,11 +148,11 @@ class ChessEvaluator:
         # Convert board to input format
         moves_str = self._convert_board_to_moves(board)
         
-        # Add BOS token if no moves yet, and a trailing space to start a new move.
+        # Add BOS token if no moves yet
         if not moves_str:
-            input_text = self.tokenizer.bos_token + " "
+            input_text = self.tokenizer.bos_token
         else:
-            input_text = self.tokenizer.bos_token + " " + moves_str + " "
+            input_text = self.tokenizer.bos_token + " " + moves_str
         
         # Tokenize
         inputs = self.tokenizer(
@@ -164,80 +162,42 @@ class ChessEvaluator:
             max_length=self.model.config.n_ctx - 1,
         ).to(self.device)
         
-        if self._token_texts is None:
-            vocab_size = len(self.tokenizer)
-            self._token_texts = [
-                self.tokenizer.decode([token_id], clean_up_tokenization_spaces=False)
-                for token_id in range(vocab_size)
-            ]
-            self._special_token_ids = {
-                self.tokenizer.pad_token_id,
-                self.tokenizer.bos_token_id,
-                self.tokenizer.eos_token_id,
-                self.tokenizer.unk_token_id,
-            }
-
-        from src.utils import append_token_to_move_prefix, is_complete_move
-
-        max_move_tokens = 16
-
-        # Try to generate a valid move
+        # Try to generate a legal move
         for retry in range(self.max_retries):
-            prefix = ""
-            input_ids = inputs["input_ids"]
-            attention_mask = inputs["attention_mask"]
-
-            for _ in range(max_move_tokens):
-                with torch.no_grad():
-                    outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
-                    logits = outputs.logits[:, -1, :] / temperature
-
-                mask = torch.ones_like(logits, dtype=torch.bool)
-                for token_id, token_text in enumerate(self._token_texts):
-                    if token_id in self._special_token_ids:
-                        mask[0, token_id] = False
-                        continue
-                    if append_token_to_move_prefix(prefix, token_text) is None:
-                        mask[0, token_id] = False
-
-                if not mask.any().item():
-                    break
-                logits = logits.masked_fill(~mask, float("-inf"))
-
+            with torch.no_grad():
+                outputs = self.model(**inputs)
+                logits = outputs.logits[:, -1, :] / temperature
+                
                 # Apply top-k filtering
                 if top_k > 0:
                     indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
                     logits[indices_to_remove] = float("-inf")
-
+                
                 # Sample
                 probs = torch.softmax(logits, dim=-1)
                 next_token = torch.multinomial(probs, num_samples=1)
-
-                token_id = int(next_token[0, 0].item())
-                token_text = self._token_texts[token_id]
-                new_prefix = append_token_to_move_prefix(prefix, token_text)
-                if new_prefix is None:
-                    break
-                prefix = new_prefix
-
-                next_token = next_token.to(input_ids.device)
-                input_ids = torch.cat([input_ids, next_token], dim=1)
-                attention_mask = torch.cat(
-                    [attention_mask, torch.ones_like(next_token)], dim=1
-                )
-
-                if is_complete_move(prefix):
-                    move_token = prefix
-                    uci_move = move_token[2:4] + move_token[4:6]
-                    if "=" in move_token:
-                        promo_idx = move_token.index("=")
-                        uci_move += move_token[promo_idx + 1].lower()
-                    try:
-                        move = self.chess.Move.from_uci(uci_move)
-                        if move in board.legal_moves:
-                            return uci_move, retry
-                    except (ValueError, self.chess.InvalidMoveError):
-                        break
+            
+            # Decode the move
+            move_token = self.tokenizer.decode(next_token[0])
+            
+            # Convert to UCI
+            if len(move_token) >= 6:
+                uci_move = move_token[2:4] + move_token[4:6]
+                
+                # Handle promotion
+                if "=" in move_token:
+                    promo_idx = move_token.index("=")
+                    uci_move += move_token[promo_idx + 1].lower()
+                
+                try:
+                    move = self.chess.Move.from_uci(uci_move)
+                    if move in board.legal_moves:
+                        return uci_move, retry
+                except (ValueError, self.chess.InvalidMoveError):
+                    pass
+            
+            # Mask out the tried token for next retry
+            logits[0, next_token[0]] = float("-inf")
         
         return None, self.max_retries
     

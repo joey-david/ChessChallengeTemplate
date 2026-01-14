@@ -284,6 +284,36 @@ def append_token_to_move_prefix(prefix: str, token_text: str) -> Optional[str]:
     return candidate
 
 
+def advance_move_prefix(
+    prefix: str,
+    token_text: str,
+    prefix_complete: bool,
+) -> Optional[str]:
+    if not token_text:
+        return None
+    if prefix == "":
+        token_text = token_text.lstrip()
+    if not token_text:
+        return "" if prefix_complete or prefix == "" else None
+
+    last_ws = None
+    for idx, ch in enumerate(token_text):
+        if ch.isspace():
+            last_ws = idx
+    if last_ws is not None:
+        if prefix and not prefix_complete:
+            return None
+        suffix = token_text[last_ws + 1 :]
+        if suffix == "":
+            return ""
+        return suffix if is_valid_move_prefix(suffix) else None
+
+    candidate = prefix + token_text
+    if not is_valid_move_prefix(candidate):
+        return None
+    return candidate
+
+
 def convert_extended_uci_to_uci(move: str) -> str:
     """
     Convert extended UCI format to standard UCI format.

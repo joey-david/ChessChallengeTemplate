@@ -155,6 +155,10 @@ def main():
     
     # Create model configuration
     print("\nCreating model configuration...")
+    token_texts = [
+        tokenizer.decode([token_id], clean_up_tokenization_spaces=False)
+        for token_id in range(len(tokenizer))
+    ]
     config = ChessConfig(
         vocab_size=actual_vocab_size,
         n_embd=args.n_embd,
@@ -167,6 +171,9 @@ def main():
         pad_token_id=tokenizer.pad_token_id,
         bos_token_id=tokenizer.bos_token_id,
         eos_token_id=tokenizer.eos_token_id,
+        unk_token_id=tokenizer.unk_token_id,
+        mask_invalid_moves=True,
+        id_to_token_text=token_texts,
     )
     
     # Print parameter budget

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -64,12 +64,16 @@ class ChessConfig(PretrainedConfig):
         pad_token_id: int = 0,
         bos_token_id: int = 1,
         eos_token_id: int = 2,
+        unk_token_id: int = 3,
+        mask_invalid_moves: bool = True,
+        id_to_token_text: Optional[List[str]] = None,
         **kwargs,
     ):
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
+            unk_token_id=unk_token_id,
             **kwargs,
         )
         
@@ -84,6 +88,9 @@ class ChessConfig(PretrainedConfig):
         self.tie_weights = tie_weights
         # Inform HF base class about tying behavior
         self.tie_word_embeddings = bool(tie_weights)
+        self.unk_token_id = unk_token_id
+        self.mask_invalid_moves = mask_invalid_moves
+        self.id_to_token_text = id_to_token_text
 
 
 class MultiHeadAttention(nn.Module):
@@ -274,6 +281,9 @@ class ChessForCausalLM(PreTrainedModel):
         if config.tie_weights:
             self.tie_weights()
 
+        self._token_texts: Optional[List[str]] = None
+        self._special_token_ids: Optional[set] = None
+
     def get_input_embeddings(self) -> nn.Module:
         return self.wte
 
@@ -304,6 +314,51 @@ class ChessForCausalLM(PreTrainedModel):
         elif isinstance(module, nn.LayerNorm):
             torch.nn.init.ones_(module.weight)
             torch.nn.init.zeros_(module.bias)
+
+    def _init_token_texts(self) -> None:
+        if self._token_texts is not None:
+            return
+        id_to_token_text = getattr(self.config, "id_to_token_text", None)
+        if not id_to_token_text:
+            self._token_texts = []
+            self._special_token_ids = set()
+            return
+        self._token_texts = list(id_to_token_text)
+        self._special_token_ids = {
+            self.config.pad_token_id,
+            self.config.bos_token_id,
+            self.config.eos_token_id,
+            getattr(self.config, "unk_token_id", None),
+        }
+        self._special_token_ids.discard(None)
+
+    def _get_move_prefix(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.Tensor],
+    ) -> str:
+        self._init_token_texts()
+        if not self._token_texts:
+            return ""
+        seq_len = int(attention_mask.sum().item()) if attention_mask is not None else input_ids.size(0)
+        prefix = ""
+        for token_id in input_ids[:seq_len].tolist():
+            if self._special_token_ids and token_id in self._special_token_ids:
+                continue
+            if token_id >= len(self._token_texts):
+                continue
+            token_text = self._token_texts[token_id]
+            if not token_text:
+                continue
+            last_ws = None
+            for idx, ch in enumerate(token_text):
+                if ch.isspace():
+                    last_ws = idx
+            if last_ws is not None:
+                prefix = token_text[last_ws + 1 :]
+            else:
+                prefix += token_text
+        return prefix
     
     def forward(
         self,
@@ -351,6 +406,38 @@ class ChessForCausalLM(PreTrainedModel):
         # Get logits
         logits = self.lm_head(hidden_states)
         
+        if (
+            labels is None
+            and not self.training
+            and getattr(self.config, "mask_invalid_moves", False)
+        ):
+            from src.utils import advance_move_prefix, is_complete_move
+
+            self._init_token_texts()
+            if self._token_texts:
+                seq_index = logits.size(1) - 1
+                for batch_idx in range(batch_size):
+                    prefix = self._get_move_prefix(
+                        input_ids[batch_idx],
+                        attention_mask[batch_idx] if attention_mask is not None else None,
+                    )
+                    prefix_complete = is_complete_move(prefix)
+                    vocab_size = logits.size(-1)
+                    valid_mask = torch.zeros(
+                        vocab_size, dtype=torch.bool, device=logits.device
+                    )
+                    for token_id, token_text in enumerate(self._token_texts):
+                        if token_id >= vocab_size:
+                            break
+                        if self._special_token_ids and token_id in self._special_token_ids:
+                            continue
+                        if advance_move_prefix(prefix, token_text, prefix_complete) is not None:
+                            valid_mask[token_id] = True
+                    if valid_mask.any():
+                        logits[batch_idx, seq_index, :] = logits[batch_idx, seq_index, :].masked_fill(
+                            ~valid_mask, float("-inf")
+                        )
+
         # Compute loss if labels are provided
         loss = None
         if labels is not None:
@@ -359,7 +446,7 @@ class ChessForCausalLM(PreTrainedModel):
             shift_labels = labels[..., 1:].contiguous()
             
             # Flatten for cross-entropy
-            loss_fct = nn.CrossEntropyLoss(ignore_index=self.config.pad_token_id)
+            loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
             loss = loss_fct(
                 shift_logits.view(-1, shift_logits.size(-1)),
                 shift_labels.view(-1),
