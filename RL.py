@@ -128,7 +128,16 @@ def load_model_and_tokenizer(model_path: str, device: str):
         tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True)
     else:
-        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        # Prefer custom chess tokenizers if available for local paths.
+        try:
+            from src.tokenizer import ChessSquaresTokenizer, ChessTokenizer
+
+            try:
+                tokenizer = ChessSquaresTokenizer.from_pretrained(model_path)
+            except Exception:
+                tokenizer = ChessTokenizer.from_pretrained(model_path)
+        except Exception:
+            tokenizer = AutoTokenizer.from_pretrained(model_path)
         model = AutoModelForCausalLM.from_pretrained(model_path)
     model.to(device)
     model.config.use_cache = False
