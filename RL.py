@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import os
 import random
+import re
 import time
 from collections import deque
 from typing import List, Optional, Tuple
@@ -59,6 +60,12 @@ def parse_args() -> argparse.Namespace:
     # Sampling settings
     parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature")
     parser.add_argument("--top_k", type=int, default=20, help="Top-k sampling (0 disables)")
+    parser.add_argument(
+        "--max_move_tokens",
+        type=int,
+        default=20,
+        help="Max tokens to generate for a single move",
+    )
 
     # Stockfish settings
     parser.add_argument("--stockfish_path", type=str, default=None, help="Path to Stockfish")
@@ -164,9 +171,71 @@ def build_stockfish_engine(stockfish_path: Optional[str], stockfish_level: int):
     return engine, chess
 
 
-def convert_board_to_moves(board, chess) -> str:
+SQUARE_PATTERN = r"[a-h][1-8]"
+
+
+def detect_tokenizer_format(tokenizer) -> str:
+    cached = getattr(tokenizer, "_cached_chess_format", None)
+    if cached:
+        return cached
+
+    test_formats = {
+        "decomposed": "WP e2_f e4_t",
+        "standard": "WPe2e4",
+        "uci": "e2e4",
+        "uci_spaced": "e2 e4",
+    }
+
+    unk_token_id = getattr(tokenizer, "unk_token_id", None)
+    best_format = "standard"
+    min_unk_count = float("inf")
+
+    for fmt, sample in test_formats.items():
+        try:
+            tokens = tokenizer.encode(sample, add_special_tokens=False)
+            unk_count = tokens.count(unk_token_id) if unk_token_id is not None else 0
+            if len(tokens) == 1 and unk_count == 1:
+                unk_count = 100
+            if unk_count < min_unk_count:
+                min_unk_count = unk_count
+                best_format = fmt
+        except Exception:
+            continue
+
+    setattr(tokenizer, "_cached_chess_format", best_format)
+    return best_format
+
+
+def format_move(
+    color: str,
+    piece: str,
+    from_sq: str,
+    to_sq: str,
+    promotion: Optional[str],
+    tokenizer,
+) -> str:
+    fmt = detect_tokenizer_format(tokenizer)
+    if fmt == "decomposed":
+        move_str = f"{color}{piece} {from_sq}_f {to_sq}_t"
+    elif fmt == "uci":
+        move_str = f"{from_sq}{to_sq}"
+        if promotion:
+            move_str += promotion.lower()
+    elif fmt == "uci_spaced":
+        move_str = f"{from_sq} {to_sq}"
+        if promotion:
+            move_str += f" {promotion.lower()}"
+    else:
+        move_str = f"{color}{piece}{from_sq}{to_sq}"
+        if promotion:
+            move_str += f"={promotion}"
+    return move_str
+
+
+def convert_board_to_moves(board, chess, tokenizer) -> str:
     moves: List[str] = []
     temp_board = chess.Board()
+    fmt = detect_tokenizer_format(tokenizer)
 
     for move in board.move_stack:
         color = "W" if temp_board.turn == chess.WHITE else "B"
@@ -176,29 +245,138 @@ def convert_board_to_moves(board, chess) -> str:
         from_sq = chess.square_name(move.from_square)
         to_sq = chess.square_name(move.to_square)
 
-        move_str = f"{color}{piece_letter}{from_sq}{to_sq}"
-
+        promotion = None
         if move.promotion:
-            move_str += f"={chess.piece_symbol(move.promotion).upper()}"
+            promotion = chess.piece_symbol(move.promotion).upper()
 
-        if temp_board.is_capture(move):
-            move_str += "(x)"
+        move_str = format_move(color, piece_letter, from_sq, to_sq, promotion, tokenizer)
 
-        temp_board.push(move)
-        if temp_board.is_checkmate():
-            move_str = move_str.replace("(x)", "(x+*)") if "(x)" in move_str else move_str + "(+*)"
-        elif temp_board.is_check():
-            move_str = move_str.replace("(x)", "(x+)") if "(x)" in move_str else move_str + "(+)"
+        if fmt == "standard":
+            if temp_board.is_capture(move):
+                move_str += "(x)"
 
-        if piece_letter == "K" and abs(ord(from_sq[0]) - ord(to_sq[0])) > 1:
-            if to_sq[0] == "g":
-                move_str = move_str.split("(")[0] + "(o)"
-            else:
-                move_str = move_str.split("(")[0] + "(O)"
+            temp_board.push(move)
+            if temp_board.is_checkmate():
+                move_str = move_str.replace("(x)", "(x+*)") if "(x)" in move_str else move_str + "(+*)"
+            elif temp_board.is_check():
+                move_str = move_str.replace("(x)", "(x+)") if "(x)" in move_str else move_str + "(+)"
+
+            if piece_letter == "K" and abs(ord(from_sq[0]) - ord(to_sq[0])) > 1:
+                if to_sq[0] == "g":
+                    move_str = move_str.split("(")[0] + "(o)"
+                else:
+                    move_str = move_str.split("(")[0] + "(O)"
+        else:
+            temp_board.push(move)
 
         moves.append(move_str)
 
     return " ".join(moves)
+
+
+def is_separator_token(tokenizer, token_str: str) -> bool:
+    if hasattr(tokenizer, "eos_token") and token_str == tokenizer.eos_token:
+        return True
+    if token_str.strip() == "" and len(token_str) > 0:
+        return True
+    if token_str != token_str.rstrip():
+        return True
+    return False
+
+
+def extract_uci_move(text: str) -> Optional[str]:
+    if not text:
+        return None
+
+    squares = re.findall(SQUARE_PATTERN, text)
+    if len(squares) < 2:
+        return None
+
+    from_sq, to_sq = squares[0], squares[1]
+    uci_move = from_sq + to_sq
+
+    to_sq_idx = text.find(to_sq)
+    if to_sq_idx != -1:
+        remaining = text[to_sq_idx + 2 : to_sq_idx + 5]
+        promo_match = re.search(r"[=]?([qrbnQRBN])", remaining)
+        if promo_match:
+            uci_move += promo_match.group(1).lower()
+
+    return uci_move
+
+
+def has_complete_move(text: str) -> bool:
+    squares = re.findall(SQUARE_PATTERN, text)
+    return len(squares) >= 2
+
+
+def sample_move_tokens(
+    model,
+    ref_model,
+    tokenizer,
+    input_ids: torch.Tensor,
+    temperature: float,
+    top_k: int,
+    max_tokens: int,
+) -> Tuple[str, torch.Tensor, torch.Tensor]:
+    generated_tokens = []
+    current_ids = input_ids
+    accumulated_text = ""
+    log_prob_sum = torch.tensor(0.0, device=input_ids.device)
+    ref_log_prob_sum = torch.tensor(0.0, device=input_ids.device)
+
+    remaining = model.config.n_ctx - current_ids.shape[1]
+    max_tokens = min(max_tokens, max(0, remaining))
+
+    for _ in range(max_tokens):
+        outputs = model(input_ids=current_ids)
+        logits = outputs.logits[:, -1, :]
+        masked_logits = apply_top_k(logits, top_k)
+        scaled_logits = masked_logits / max(temperature, 1e-5)
+        log_probs = torch.log_softmax(scaled_logits, dim=-1)
+        probs = torch.softmax(scaled_logits, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1)
+        token_id = int(next_token.item())
+
+        with torch.no_grad():
+            ref_outputs = ref_model(input_ids=current_ids)
+            ref_logits = ref_outputs.logits[:, -1, :]
+            ref_masked_logits = apply_top_k(ref_logits, top_k)
+            ref_scaled_logits = ref_masked_logits / max(temperature, 1e-5)
+            ref_log_probs = torch.log_softmax(ref_scaled_logits, dim=-1)
+
+        token_str = tokenizer.decode(next_token[0])
+
+        if is_separator_token(tokenizer, token_str):
+            if has_complete_move(accumulated_text):
+                break
+            if hasattr(tokenizer, "eos_token") and token_str == tokenizer.eos_token:
+                break
+            if accumulated_text:
+                break
+
+        generated_tokens.append(next_token[0])
+        log_prob_sum = log_prob_sum + log_probs[0, token_id]
+        ref_log_prob_sum = ref_log_prob_sum + ref_log_probs[0, token_id]
+        current_ids = torch.cat([current_ids, next_token], dim=-1)
+        accumulated_text += token_str
+
+        if has_complete_move(accumulated_text):
+            squares = re.findall(SQUARE_PATTERN, accumulated_text)
+            if len(squares) >= 2:
+                to_sq = squares[1]
+                if to_sq[1] in "18":
+                    if len(generated_tokens) > 3:
+                        break
+                else:
+                    break
+
+    if generated_tokens:
+        all_tokens = torch.cat(generated_tokens, dim=0)
+        move_str = tokenizer.decode(all_tokens, skip_special_tokens=True)
+        return move_str.strip(), log_prob_sum, ref_log_prob_sum
+
+    return "", log_prob_sum, ref_log_prob_sum
 
 
 def token_to_uci(token: str) -> Optional[str]:
@@ -335,7 +513,7 @@ def main() -> None:
     total_illegal = 0
     running_reward = 0.0
 
-    max_length = max(1, model.config.n_ctx - 1)
+    max_length = max(1, model.config.n_ctx - max(args.max_move_tokens, 1) - 1)
 
     start_time = time.time()
     last_save_time = start_time
@@ -367,7 +545,7 @@ def main() -> None:
 
             prompts = []
             for board in boards:
-                moves_str = convert_board_to_moves(board, chess)
+                moves_str = convert_board_to_moves(board, chess, tokenizer)
                 if moves_str:
                     prompts.append(f"{tokenizer.bos_token} {moves_str}")
                 else:
@@ -383,38 +561,27 @@ def main() -> None:
             input_ids = enc["input_ids"].to(args.device)
             attention_mask = enc["attention_mask"].to(args.device)
 
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            logits = outputs.logits
-            seq_lens = attention_mask.sum(dim=1) - 1
-            batch_indices = torch.arange(input_ids.size(0), device=input_ids.device)
-            last_logits = logits[batch_indices, seq_lens, :]
-
-            masked_logits = apply_top_k(last_logits, args.top_k)
-            scaled_logits = masked_logits / max(args.temperature, 1e-5)
-            log_probs = torch.log_softmax(scaled_logits, dim=-1)
-            probs = torch.softmax(scaled_logits, dim=-1)
-
-            with torch.no_grad():
-                ref_outputs = ref_model(input_ids=input_ids, attention_mask=attention_mask)
-                ref_last_logits = ref_outputs.logits[batch_indices, seq_lens, :]
-                ref_masked_logits = apply_top_k(ref_last_logits, args.top_k)
-                ref_scaled_logits = ref_masked_logits / max(args.temperature, 1e-5)
-                ref_log_probs = torch.log_softmax(ref_scaled_logits, dim=-1)
-
-            token_samples = torch.multinomial(
-                probs, num_samples=args.group_size, replacement=True
-            )
-            sample_log_probs = log_probs.gather(1, token_samples)
-            sample_ref_log_probs = ref_log_probs.gather(1, token_samples)
-
-            sample_rewards = torch.zeros_like(sample_log_probs, device="cpu")
-            sample_illegal = torch.zeros_like(sample_log_probs, device="cpu")
+            sample_log_probs_rows = []
+            sample_ref_log_probs_rows = []
+            sample_rewards = torch.zeros(args.batch_size, args.group_size, device="cpu")
+            sample_illegal = torch.zeros_like(sample_rewards, device="cpu")
 
             for i, board in enumerate(boards):
+                seq_len = int(attention_mask[i].sum().item())
+                prompt_ids = input_ids[i : i + 1, :seq_len]
+                row_log_probs = []
+                row_ref_log_probs = []
                 for j in range(args.group_size):
-                    token_id = int(token_samples[i, j].item())
-                    token_str = tokenizer.convert_ids_to_tokens(token_id)
-                    move_uci = token_to_uci(token_str)
+                    move_text, log_prob_sum, ref_log_prob_sum = sample_move_tokens(
+                        model=model,
+                        ref_model=ref_model,
+                        tokenizer=tokenizer,
+                        input_ids=prompt_ids,
+                        temperature=args.temperature,
+                        top_k=args.top_k,
+                        max_tokens=args.max_move_tokens,
+                    )
+                    move_uci = extract_uci_move(move_text)
                     if move_uci is None:
                         reward = args.illegal_penalty
                         legal = False
@@ -435,9 +602,16 @@ def main() -> None:
                         )
                     sample_rewards[i, j] = reward
                     sample_illegal[i, j] = 0.0 if legal else 1.0
+                    row_log_probs.append(log_prob_sum)
+                    row_ref_log_probs.append(ref_log_prob_sum)
                     if loss_window is not None:
                         is_loss = (not legal) or (score_after is None) or (score_after < 0)
                         loss_window.append(1.0 if is_loss else 0.0)
+                sample_log_probs_rows.append(torch.stack(row_log_probs))
+                sample_ref_log_probs_rows.append(torch.stack(row_ref_log_probs))
+
+            sample_log_probs = torch.stack(sample_log_probs_rows)
+            sample_ref_log_probs = torch.stack(sample_ref_log_probs_rows)
 
             advantages = torch.zeros_like(sample_rewards)
             for i in range(args.batch_size):
